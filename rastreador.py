@@ -1,31 +1,65 @@
 import os
 import requests
 import pandas as pd
+import math
+import time
 from dotenv import load_dotenv
 
 # ==========================================================
-# 1. CARGA SEGURA DE CREDENCIALES
+# 1. PANEL DE CONTROL (MODIFICA ESTAS VARIABLES)
 # ==========================================================
-# Esto lee el archivo .env y carga las variables
-load_dotenv()
+CATEGORIA = "hair_care"      # Negocio a buscar (ej: "hair_care", "car_repair")
+RADIO_METROS = 800           # Radio de cada petición individual
 
-# Extraemos la clave de forma segura
+# Coordenadas del centro geográfico de tu búsqueda
+LATITUD_CENTRAL = 40.4850    # Coordenadas aproximadas del centro del área marcada
+LONGITUD_CENTRAL = -3.3600
+
+# Tamaño de la cuadrícula (Filas x Columnas)
+FILAS_LATITUD = 2            # Eje vertical (Norte-Sur)
+COLUMNAS_LONGITUD = 3        # Eje horizontal (Este-Oeste)
+# Total de peticiones consumidas = FILAS * COLUMNAS (ej: 2x3 = 6 peticiones)
+
+# ==========================================================
+# 2. CARGA DE CREDENCIALES
+# ==========================================================
+load_dotenv()
 API_KEY = os.getenv("GOOGLE_API_KEY")
 
 if not API_KEY:
     raise ValueError("¡Error! No se ha encontrado la GOOGLE_API_KEY en el archivo .env")
 
 # ==========================================================
-# 2. CONFIGURACIÓN DE BÚSQUEDA
+# 3. GENERADOR MATEMÁTICO DE CUADRÍCULA
 # ==========================================================
-LATITUD = 40.4819
-LONGITUD = -3.3635
-RADIO = 3000.0  
+def generar_coordenadas(lat_centro, lon_centro, radio, filas, columnas):
+    coordenadas = []
+    # El salto óptimo para solapar círculos y no dejar huecos es Radio * 1.5
+    distancia_salto_metros = radio * 1.5
+    
+    # Conversión de metros a grados (aproximación terrestre estándar)
+    # 1 grado de latitud = 111.32 km
+    salto_lat_grados = distancia_salto_metros / 111320.0
+    # 1 grado de longitud = 111.32 km * cos(latitud)
+    salto_lon_grados = distancia_salto_metros / (111320.0 * math.cos(math.radians(lat_centro)))
 
-CATEGORIAS = ["car_repair", "hair_care", "restaurant"]
+    # Calcular los puntos (centrando la cuadrícula en las coordenadas base)
+    for i in range(filas):
+        offset_lat = i - (filas - 1) / 2.0
+        lat_actual = lat_centro + (offset_lat * salto_lat_grados)
+        
+        for j in range(columnas):
+            offset_lon = j - (columnas - 1) / 2.0
+            lon_actual = lon_centro + (offset_lon * salto_lon_grados)
+            
+            coordenadas.append((lat_actual, lon_actual))
+            
+    return coordenadas
 
-def buscar_negocios_sin_web(categoria):
-    print(f"Buscando {categoria} en Alcalá...")
+# ==========================================================
+# 4. MOTOR DE BÚSQUEDA A LA API
+# ==========================================================
+def buscar_negocios(lat, lon, categoria, radio):
     url = "https://places.googleapis.com/v1/places:searchNearby"
     
     headers = {
@@ -39,8 +73,8 @@ def buscar_negocios_sin_web(categoria):
         "maxResultCount": 20, 
         "locationRestriction": {
             "circle": {
-                "center": {"latitude": LATITUD, "longitude": LONGITUD},
-                "radius": RADIO
+                "center": {"latitude": lat, "longitude": lon},
+                "radius": radio
             }
         }
     }
@@ -48,13 +82,14 @@ def buscar_negocios_sin_web(categoria):
     response = requests.post(url, json=payload, headers=headers)
     
     if response.status_code != 200:
-        print(f"Error en {categoria}: {response.text}")
+        print(f"Error en la API: {response.text}")
         return []
 
     lugares = response.json().get('places', [])
     leads = []
 
     for lugar in lugares:
+        # Extraemos solo los que NO tienen página web (websiteUri)
         if 'websiteUri' not in lugar:
             leads.append({
                 "Categoría": categoria,
@@ -66,21 +101,40 @@ def buscar_negocios_sin_web(categoria):
     return leads
 
 # ==========================================================
-# 3. EJECUCIÓN PRINCIPAL
+# 5. EJECUCIÓN DEL BARRIDO (GRID SEARCH)
 # ==========================================================
+print(f"Iniciando barrido de '{CATEGORIA}'...")
+print(f"Generando cuadrícula de {FILAS_LATITUD}x{COLUMNAS_LONGITUD} ({FILAS_LATITUD * COLUMNAS_LONGITUD} peticiones)...")
+
+lista_puntos = generar_coordenadas(LATITUD_CENTRAL, LONGITUD_CENTRAL, RADIO_METROS, FILAS_LATITUD, COLUMNAS_LONGITUD)
 prospectos_totales = []
 
-for cat in CATEGORIAS:
-    leads_encontrados = buscar_negocios_sin_web(cat)
+for idx, (lat, lon) in enumerate(lista_puntos):
+    print(f"Petición {idx + 1}/{len(lista_puntos)} -> Buscando en Lat: {lat:.5f}, Lon: {lon:.5f}")
+    leads_encontrados = buscar_negocios(lat, lon, CATEGORIA, RADIO_METROS)
     prospectos_totales.extend(leads_encontrados)
+    
+    # Pausa de seguridad de 1 segundo para no saturar los servidores de Google
+    time.sleep(1)
 
 # ==========================================================
-# 4. EXPORTAR A EXCEL
+# 6. FILTRADO FINAL Y EXPORTACIÓN
 # ==========================================================
 if prospectos_totales:
     df = pd.DataFrame(prospectos_totales)
-    nombre_archivo = "leads_alcala_sin_web.csv"
+    
+    # Al solaparse los círculos, habrá negocios repetidos. Los eliminamos aquí:
+    total_bruto = len(df)
+    df = df.drop_duplicates(subset=['Nombre', 'Dirección'])
+    total_limpio = len(df)
+    
+    nombre_archivo = f"leads_{CATEGORIA}_grid.csv"
     df.to_csv(nombre_archivo, index=False, encoding='utf-8-sig')
-    print(f"\n¡Éxito! Se han guardado {len(prospectos_totales)} negocios SIN WEB en '{nombre_archivo}'.")
+    
+    print("\n--- RESULTADOS DEL BARRIDO ---")
+    print(f"Leads brutos extraídos: {total_bruto}")
+    print(f"Duplicados eliminados: {total_bruto - total_limpio}")
+    print(f"Leads únicos guardados: {total_limpio}")
+    print(f"Archivo generado: {nombre_archivo}")
 else:
-    print("\nNo se encontraron negocios sin web o hubo un error.")
+    print("\nEl barrido ha finalizado, pero no se encontraron negocios sin web en la zona.")
